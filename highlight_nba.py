@@ -525,6 +525,8 @@ def main():
     parser.add_argument("--watermark", default="fb-watermark.png", help="Path to PNG watermark image (set empty string to disable)")
     parser.add_argument("--wm-width", type=int, default=96, help="Watermark width in pixels (0 = original size)")
     parser.add_argument("--wm-margin", type=int, default=20, help="Margin in pixels from bottom-right corner")
+    parser.add_argument("--clips-dir", default="", help="Directory to save individual highlight clips (default: <output_basename>_clips beside output)")
+    parser.add_argument("--no-combined", action="store_true", help="Only export individual clips, skip combined highlights video")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
 
     args = parser.parse_args()
@@ -607,81 +609,92 @@ def main():
 
     segments = clamp_segments(events, duration, args.pre, args.post)
 
+    # Determine clips directory from args or derive from output path
+    base_name = os.path.splitext(os.path.basename(output_path))[0]
+    default_clips_dir = os.path.join(os.path.dirname(output_path), base_name + "_clips")
+    clips_dir = os.path.abspath(args.clips_dir) if getattr(args, "clips_dir", None) else default_clips_dir
+    os.makedirs(clips_dir, exist_ok=True)
+    logging.info("Saving individual clips to: %s", clips_dir)
+
+    wm_path = os.path.abspath(args.watermark).strip() if isinstance(args.watermark, str) else ""
+    apply_wm = len(wm_path) > 0 and os.path.isfile(wm_path)
+    if not apply_wm and len(wm_path) > 0:
+        logging.warning("Watermark file not found at %s. Proceeding without watermark.", wm_path)
+
     with tempfile.TemporaryDirectory(prefix="nba_highlight_") as td:
-        seg_paths: List[str] = []
+        concat_inputs: List[str] = []
         for i, (start, dur) in enumerate(segments):
-            out_seg = os.path.join(td, f"seg_{i:04d}.mp4")
+            temp_seg = os.path.join(td, f"seg_{i:04d}.mp4")
             try:
-                ffmpeg_extract_segment(input_path, start, dur, out_seg, reencode=args.reencode)
-                seg_paths.append(out_seg)
+                ffmpeg_extract_segment(input_path, start, dur, temp_seg, reencode=args.reencode)
             except subprocess.CalledProcessError as e:
                 logging.warning("Failed to cut segment %d at %.2fs (%.2fs): %s", i, start, dur, e)
                 continue
 
-        if not seg_paths:
-            logging.error("No segments were successfully cut.")
+            # Final per-clip output path
+            clip_name = f"{base_name}_{i:04d}.mp4"
+            clip_out = os.path.join(clips_dir, clip_name)
+            try:
+                if apply_wm:
+                    ffmpeg_overlay_watermark(temp_seg, wm_path, clip_out, margin=args.wm_margin, wm_width=args.wm_width)
+                else:
+                    shutil.move(temp_seg, clip_out)
+                concat_inputs.append(clip_out)
+            except subprocess.CalledProcessError as e:
+                logging.warning("Failed to finalize clip %d: %s", i, e)
+                continue
+
+        if not concat_inputs:
+            logging.error("No clips were successfully created.")
             sys.exit(3)
 
-        # Write concat list
-        list_path = os.path.join(td, "concat.txt")
-        with open(list_path, "w", encoding="utf-8") as f:
-            for p in seg_paths:
-                # Use forward slashes or escape backslashes
-                fp = p.replace("\\", "/")
-                f.write(f"file '{fp}'\n")
-
-        # First, concatenate the segments into a temporary file
-        concat_tmp = os.path.join(td, "concat_tmp.mp4")
-        try:
-            ffmpeg_concat_filelist(list_path, concat_tmp)
-        except subprocess.CalledProcessError:
-            logging.warning("Concat with stream copy failed. Re-encoding concat as fallback...")
-            # Fallback: re-encode concat using filter_complex
-            cmd = ["ffmpeg", "-y"]
-            for p in seg_paths:
-                cmd.extend(["-i", p])
-            n = len(seg_paths)
-            streams = []
-            for i in range(n):
-                streams.append(f"[{i}:v][{i}:a]")
-            filter_concat = "".join(streams) + f"concat=n={n}:v=1:a=1[v][a]"
-            cmd.extend([
-                "-filter_complex",
-                filter_concat,
-                "-map",
-                "[v]",
-                "-map",
-                "[a]",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "160k",
-                "-movflags",
-                "+faststart",
-                concat_tmp,
-            ])
-            subprocess.run(cmd, check=True)
-
-        # Apply watermark if available, else move concat to final output
-        wm_path = os.path.abspath(args.watermark).strip() if isinstance(args.watermark, str) else ""
-        apply_wm = len(wm_path) > 0 and os.path.isfile(wm_path)
-        if apply_wm:
-            logging.info("Applying watermark: %s", wm_path)
-            try:
-                ffmpeg_overlay_watermark(concat_tmp, wm_path, output_path, margin=args.wm_margin, wm_width=args.wm_width)
-            except subprocess.CalledProcessError as e:
-                logging.error("Watermark overlay failed: %s", e)
-                sys.exit(4)
+        if args.no_combined:
+            logging.info("Skipping combined highlights output (--no-combined specified).")
         else:
-            if len(wm_path) > 0:
-                logging.warning("Watermark file not found at %s. Proceeding without watermark.", wm_path)
-            shutil.move(concat_tmp, output_path)
+            # Write concat list from per-clip outputs
+            list_path = os.path.join(td, "concat.txt")
+            with open(list_path, "w", encoding="utf-8") as f:
+                for p in concat_inputs:
+                    # Use forward slashes or escape backslashes
+                    fp = p.replace("\\", "/")
+                    f.write(f"file '{fp}'\n")
+
+            # Concatenate
+            try:
+                ffmpeg_concat_filelist(list_path, output_path)
+            except subprocess.CalledProcessError:
+                logging.warning("Concat with stream copy failed. Re-encoding combined output as fallback...")
+                # Fallback: re-encode concat using filter_complex
+                cmd = ["ffmpeg", "-y"]
+                for p in concat_inputs:
+                    cmd.extend(["-i", p])
+                n = len(concat_inputs)
+                streams = []
+                for i in range(n):
+                    streams.append(f"[{i}:v][{i}:a]")
+                filter_concat = "".join(streams) + f"concat=n={n}:v=1:a=1[v][a]"
+                cmd.extend([
+                    "-filter_complex",
+                    filter_concat,
+                    "-map",
+                    "[v]",
+                    "-map",
+                    "[a]",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "23",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "160k",
+                    "-movflags",
+                    "+faststart",
+                    output_path,
+                ])
+                subprocess.run(cmd, check=True)
 
     logging.info("Highlights written to: %s", output_path)
 
