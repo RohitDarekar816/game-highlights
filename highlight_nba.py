@@ -12,6 +12,11 @@ Primary method:
 Fallback method:
 - Audio peak detection (ffmpeg + numpy): find crowd/announcer excitement peaks.
 
+Fighting scene detection:
+- Motion analysis: detect high-intensity movement and optical flow patterns.
+- Visual intensity: analyze frame differences and brightness changes.
+- Audio analysis: detect combat sounds and audio spikes.
+
 Video segmenting and concatenation are performed via ffmpeg.
 
 Requirements (Python packages):
@@ -27,7 +32,11 @@ System dependencies:
 
 Usage example:
   python highlight_nba.py --input "full_game.mp4" --output "highlights.mp4" \
-    --pre 6 --post 4 --sample-fps 2 --max-clips 40
+    --pre 6 --post 4 --sample-fps 2 --max-clips 40 --pitch 1.5
+
+Fighting scene detection:
+  python highlight_nba.py --input "game_footage.mp4" --output "fighting_highlights.mp4" \
+    --fighting-mode --motion-threshold 20 --fighting-sample-fps 2 --max-clips 30
 
 Optional: set Tesseract explicitly if not auto-detected
   setx TESSERACT_CMD "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
@@ -296,6 +305,7 @@ def ffmpeg_extract_segment(
     duration_s: float,
     out_path: str,
     reencode: bool = True,
+    pitch_factor: float = 1.0,
 ) -> None:
     # Ensure positive clamp
     start_s = max(0.0, start_s)
@@ -322,14 +332,41 @@ def ffmpeg_extract_segment(
             "23",
             "-pix_fmt",
             "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "160k",
+        ]
+        
+        # Add audio processing with pitch adjustment if needed
+        if pitch_factor != 1.0:
+            # Use atempo filter for pitch adjustment (range: 0.5 to 2.0)
+            # For values outside this range, we need to chain multiple atempo filters
+            audio_filter = ""
+            temp_pitch = pitch_factor
+            while temp_pitch > 2.0:
+                audio_filter += "atempo=2.0,"
+                temp_pitch /= 2.0
+            while temp_pitch < 0.5:
+                audio_filter += "atempo=0.5,"
+                temp_pitch /= 0.5
+            if temp_pitch != 1.0:
+                audio_filter += f"atempo={temp_pitch:.3f}"
+            if audio_filter.endswith(","):
+                audio_filter = audio_filter[:-1]
+            
+            cmd.extend([
+                "-af", audio_filter,
+                "-c:a", "aac",
+                "-b:a", "160k",
+            ])
+        else:
+            cmd.extend([
+                "-c:a", "aac",
+                "-b:a", "160k",
+            ])
+        
+        cmd.extend([
             "-movflags",
             "+faststart",
             out_path,
-        ]
+        ])
     else:
         # Stream copy (fast but cut points may be off if not on keyframes)
         cmd = [
@@ -371,6 +408,7 @@ def ffmpeg_overlay_watermark(
     output_path: str,
     margin: int = 20,
     wm_width: int = 96,
+    pitch_factor: float = 1.0,
 ) -> None:
     # Build filter to place watermark at bottom-right with margin.
     if wm_width and wm_width > 0:
@@ -399,14 +437,162 @@ def ffmpeg_overlay_watermark(
         "23",
         "-pix_fmt",
         "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "160k",
+    ]
+    
+    # Add audio processing with pitch adjustment if needed
+    if pitch_factor != 1.0:
+        # Use atempo filter for pitch adjustment (range: 0.5 to 2.0)
+        # For values outside this range, we need to chain multiple atempo filters
+        audio_filter = ""
+        temp_pitch = pitch_factor
+        while temp_pitch > 2.0:
+            audio_filter += "atempo=2.0,"
+            temp_pitch /= 2.0
+        while temp_pitch < 0.5:
+            audio_filter += "atempo=0.5,"
+            temp_pitch /= 0.5
+        if temp_pitch != 1.0:
+            audio_filter += f"atempo={temp_pitch:.3f}"
+        if audio_filter.endswith(","):
+            audio_filter = audio_filter[:-1]
+        
+        cmd.extend([
+            "-af", audio_filter,
+            "-c:a", "aac",
+            "-b:a", "160k",
+        ])
+    else:
+        cmd.extend([
+            "-c:a", "aac",
+            "-b:a", "160k",
+        ])
+    
+    cmd.extend([
         "-movflags",
         "+faststart",
         output_path,
+    ])
+    subprocess.run(cmd, check=True)
+
+
+def ffmpeg_finalize_clip(
+    input_path: str,
+    output_path: str,
+    watermark_path: str = "",
+    wm_margin: int = 20,
+    wm_width: int = 96,
+    pitch_factor: float = 1.0,
+    bgm_path: str = "",
+    video_volume: float = 1.0,
+    bgm_volume: float = 0.25,
+) -> None:
+    """
+    Finalize a clip by optionally overlaying a watermark and mixing background music.
+
+    - If watermark_path is a valid file, overlay it on video.
+    - If bgm_path is a valid file, mix it with the clip's audio at specified volumes.
+    - Applies audio pitch/tempo adjustment if pitch_factor != 1.0.
+    """
+    inputs = ["-i", input_path]
+    map_video_label = "[0:v]"
+    filter_parts: List[str] = []
+    audio_inputs = []  # labels that will be mixed
+
+    # Watermark input (index 1)
+    apply_wm = watermark_path and os.path.isfile(watermark_path)
+    if apply_wm:
+        inputs += ["-i", watermark_path]
+        if wm_width and wm_width > 0:
+            # Scale watermark then overlay
+            filter_parts.append(f"[1:v]scale={wm_width}:-1[wm]")
+            filter_parts.append(f"[0:v][wm]overlay=W-w-{wm_margin}:H-h-{wm_margin}:format=auto[v]")
+        else:
+            filter_parts.append(f"[0:v][1:v]overlay=W-w-{wm_margin}:H-h-{wm_margin}:format=auto[v]")
+        map_video_label = "[v]"
+
+    # Background music input (after watermark if present)
+    apply_bgm = bgm_path and os.path.isfile(bgm_path)
+    if apply_bgm:
+        # Loop BGM to cover the clip duration; will be trimmed by -shortest or amix duration
+        inputs = ["-stream_loop", "-1", *inputs]  # loop applies to the next input
+        inputs += ["-i", bgm_path]
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        *inputs,
+        "-filter_complex",
     ]
+
+    # Audio chain
+    # Start with original audio if present
+    audio_filter_chain = []
+    # Pitch/tempo adjustment for original audio only if requested
+    audio_atempo_chain = []
+    if pitch_factor != 1.0:
+        temp_pitch = pitch_factor
+        while temp_pitch > 2.0:
+            audio_atempo_chain.append("atempo=2.0")
+            temp_pitch /= 2.0
+        while temp_pitch < 0.5:
+            audio_atempo_chain.append("atempo=0.5")
+            temp_pitch /= 0.5
+        if temp_pitch != 1.0:
+            audio_atempo_chain.append(f"atempo={temp_pitch:.3f}")
+
+    # Original audio label
+    # We will guard mapping with optional map later; for filter graph, use 0:a if exists
+    # Apply pitch and volume
+    if audio_atempo_chain:
+        audio_filter_chain.append(f"[0:a]{','.join(audio_atempo_chain)}[a0t]")
+        audio_filter_chain.append(f"[a0t]volume={max(0.0, float(video_volume)):.3f}[a0]")
+    else:
+        audio_filter_chain.append(f"[0:a]volume={max(0.0, float(video_volume)):.3f}[a0]")
+    audio_inputs.append("[a0]")
+
+    # BGM chain (index depends on whether watermark was added). Compute its stream index:
+    # input indices: 0 = clip, 1 = wm (if any), 2 = bgm (if wm present) or 1 = bgm (if no wm)
+    if apply_bgm:
+        bgm_input_index = 2 if apply_wm else 1
+        audio_filter_chain.append(f"[{bgm_input_index}:a]volume={max(0.0, float(bgm_volume)):.3f}[abgm]")
+        audio_inputs.append("[abgm]")
+
+    # Build combined filter_complex
+    fc_parts = []
+    fc_parts.extend(filter_parts)
+    fc_parts.extend(audio_filter_chain)
+
+    # Mix or select audio
+    if len(audio_inputs) == 2:
+        # Use video length as duration so mix stops with the clip
+        fc_parts.append(f"{''.join(audio_inputs)}amix=inputs=2:duration=first:dropout_transition=2[a]")
+    elif len(audio_inputs) == 1:
+        fc_parts.append(f"{audio_inputs[0]}anull[a]")
+    # else: no audio available; we'll map none
+
+    cmd.append(";".join(fc_parts))
+
+    # Mapping and codecs
+    cmd += [
+        "-map",
+        map_video_label,
+    ]
+    if len(audio_inputs) >= 1:
+        cmd += ["-map", "[a]"]
+    else:
+        cmd += ["-an"]
+
+    cmd += [
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "160k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
     subprocess.run(cmd, check=True)
 
 
@@ -491,6 +677,214 @@ def pick_peaks(
     return [float(times[i]) for i in sel_sorted]
 
 
+def calculate_optical_flow_magnitude(frame1: np.ndarray, frame2: np.ndarray) -> float:
+    """Calculate the magnitude of optical flow between two frames using Farneback method."""
+    gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+    
+    try:
+        # Use Farneback optical flow which doesn't require feature points
+        flow = cv2.calcOpticalFlowFarneback(gray1, gray2, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        
+        # Calculate magnitude of flow vectors
+        magnitude = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
+        return float(np.mean(magnitude))
+    except Exception:
+        # Fallback to simple frame difference if optical flow fails
+        diff = cv2.absdiff(gray1, gray2)
+        return float(np.mean(diff))
+
+
+def calculate_frame_difference_intensity(frame1: np.ndarray, frame2: np.ndarray) -> float:
+    """Calculate the intensity of differences between two frames."""
+    gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+    
+    # Calculate absolute difference
+    diff = cv2.absdiff(gray1, gray2)
+    return float(np.mean(diff))
+
+
+def calculate_motion_energy(frame1: np.ndarray, frame2: np.ndarray) -> float:
+    """Calculate motion energy using frame differencing and optical flow."""
+    # Frame difference intensity
+    diff_intensity = calculate_frame_difference_intensity(frame1, frame2)
+    
+    # Optical flow magnitude
+    flow_magnitude = calculate_optical_flow_magnitude(frame1, frame2)
+    
+    # Combine both metrics (weighted average)
+    motion_energy = 0.7 * diff_intensity + 0.3 * flow_magnitude
+    return motion_energy
+
+
+def detect_fighting_scenes(
+    cap: cv2.VideoCapture,
+    duration: float,
+    sample_fps: float = 1.0,
+    motion_threshold: float = 15.0,
+    min_gap_s: float = 3.0,
+    max_clips: Optional[int] = None,
+) -> List[float]:
+    """
+    Detect fighting scenes using motion analysis and visual intensity.
+    Optimized for large videos with efficient sampling and early termination.
+    
+    Args:
+        cap: Video capture object
+        duration: Video duration in seconds
+        sample_fps: Frames per second to sample
+        motion_threshold: Minimum motion energy to consider as fighting
+        min_gap_s: Minimum gap between detected fighting scenes
+        max_clips: Maximum number of fighting scenes to detect
+    
+    Returns:
+        List of timestamps where fighting scenes are detected
+    """
+    # For very long videos, use more aggressive sampling
+    if duration > 3600:  # > 1 hour
+        sample_fps = min(sample_fps, 0.5)  # Max 0.5 FPS for long videos
+        logging.info("Large video detected (%.1f s), using reduced sampling rate: %.1f FPS", duration, sample_fps)
+    
+    times = time_points(duration, sample_fps)
+    if len(times) < 2:
+        return []
+    
+    # Limit processing for very long videos
+    max_samples = 2000 if duration > 3600 else 5000
+    if len(times) > max_samples:
+        # Sample evenly across the video
+        indices = np.linspace(0, len(times) - 1, max_samples).astype(int)
+        times = [times[i] for i in indices]
+        logging.info("Reduced sampling to %d frames for efficiency", len(times))
+    
+    motion_energies = []
+    valid_times = []
+    
+    # Calculate motion energy for each frame with progress logging
+    prev_frame = None
+    total_frames = len(times)
+    
+    for i, t in enumerate(times):
+        if i % 100 == 0 and total_frames > 200:
+            logging.info("Processing frame %d/%d (%.1f%%)", i, total_frames, 100.0 * i / total_frames)
+        
+        frame = read_frame_at_time(cap, t)
+        if frame is None:
+            continue
+            
+        if prev_frame is not None:
+            # Use simplified motion detection for efficiency
+            motion_energy = calculate_frame_difference_intensity(prev_frame, frame)
+            motion_energies.append(motion_energy)
+            valid_times.append(t)
+        
+        prev_frame = frame
+        
+        # Early termination if we have enough high-energy scenes
+        if max_clips and len(motion_energies) > max_clips * 3:
+            # Check if we have enough high-energy scenes to stop early
+            if len(motion_energies) > 0:
+                current_threshold = np.percentile(motion_energies, 80)
+                high_energy_count = sum(1 for e in motion_energies if e > current_threshold)
+                if high_energy_count >= max_clips:
+                    logging.info("Early termination: found %d high-energy scenes", high_energy_count)
+                    break
+    
+    if len(motion_energies) == 0:
+        return []
+    
+    # Convert to numpy arrays for easier processing
+    motion_array = np.array(motion_energies)
+    time_array = np.array(valid_times)
+    
+    # Calculate threshold based on statistics
+    mean_motion = np.mean(motion_array)
+    std_motion = np.std(motion_array)
+    threshold = max(motion_threshold, mean_motion + 1.5 * std_motion)
+    
+    logging.info("Motion analysis: mean=%.2f, std=%.2f, threshold=%.2f", mean_motion, std_motion, threshold)
+    
+    # Find peaks in motion energy
+    fighting_scenes = []
+    for i in range(1, len(motion_array) - 1):
+        if (motion_array[i] > threshold and 
+            motion_array[i] > motion_array[i - 1] and 
+            motion_array[i] >= motion_array[i + 1]):
+            fighting_scenes.append(time_array[i])
+    
+    logging.info("Found %d potential fighting scenes before filtering", len(fighting_scenes))
+    
+    # Apply minimum gap filtering
+    if min_gap_s > 0 and fighting_scenes:
+        filtered_scenes = [fighting_scenes[0]]
+        for scene_time in fighting_scenes[1:]:
+            if scene_time - filtered_scenes[-1] >= min_gap_s:
+                filtered_scenes.append(scene_time)
+        fighting_scenes = filtered_scenes
+    
+    # Limit number of scenes if specified
+    if max_clips and len(fighting_scenes) > max_clips:
+        # Sort by motion energy and take top scenes
+        scene_energies = []
+        for scene_time in fighting_scenes:
+            # Find closest time index
+            closest_idx = np.argmin(np.abs(time_array - scene_time))
+            scene_energies.append((scene_time, motion_array[closest_idx]))
+        
+        # Sort by energy and take top scenes
+        scene_energies.sort(key=lambda x: x[1], reverse=True)
+        fighting_scenes = [scene[0] for scene in scene_energies[:max_clips]]
+        fighting_scenes.sort()
+    
+    logging.info("Final result: %d fighting scenes detected", len(fighting_scenes))
+    return fighting_scenes
+
+
+def detect_combat_audio_peaks(
+    wav_path: str,
+    threshold_std: float = 2.0,
+    min_gap_s: float = 2.0,
+    max_peaks: Optional[int] = None,
+) -> List[float]:
+    """
+    Detect combat audio peaks using more aggressive thresholds than regular audio.
+    Combat sounds typically have higher intensity and different frequency characteristics.
+    """
+    try:
+        t_arr, rms_arr, _ = audio_rms_envelope(wav_path, window_ms=100, hop_ms=50)
+    except Exception:
+        return []
+    
+    if len(rms_arr) == 0:
+        return []
+    
+    # Use higher threshold for combat detection
+    mu = float(np.mean(rms_arr))
+    sigma = float(np.std(rms_arr) + 1e-6)
+    thr = mu + threshold_std * sigma
+    
+    # Find peaks
+    peaks = []
+    for i in range(1, len(rms_arr) - 1):
+        if rms_arr[i] > thr and rms_arr[i] > rms_arr[i - 1] and rms_arr[i] >= rms_arr[i + 1]:
+            peaks.append(i)
+    
+    # Apply minimum gap
+    sel = []
+    last_t = -1e9
+    for idx in sorted(peaks, key=lambda i: rms_arr[i], reverse=True):
+        t = float(t_arr[idx])
+        if (t - last_t) >= min_gap_s:
+            sel.append(idx)
+            last_t = t
+        if max_peaks and len(sel) >= max_peaks:
+            break
+    
+    sel_sorted = sorted(sel)
+    return [float(t_arr[i]) for i in sel_sorted]
+
+
 def clamp_segments(events: List[float], duration: float, pre_s: float, post_s: float) -> List[Tuple[float, float]]:
     segs: List[Tuple[float, float]] = []
     for t in events:
@@ -527,9 +921,25 @@ def main():
     parser.add_argument("--wm-margin", type=int, default=20, help="Margin in pixels from bottom-right corner")
     parser.add_argument("--clips-dir", default="", help="Directory to save individual highlight clips (default: <output_basename>_clips beside output)")
     parser.add_argument("--no-combined", action="store_true", help="Only export individual clips, skip combined highlights video")
+    parser.add_argument("--pitch", type=float, default=1.0, help="Audio pitch adjustment factor (1.0 = original, 1.5 = 1.5x speed/pitch, 0.5 = half speed/pitch)")
+    parser.add_argument("--bgm", default="", help="Path to background music audio file (mp3/wav/etc). Empty to disable")
+    parser.add_argument("--bgm-volume", type=float, default=0.25, help="Background music volume multiplier (e.g., 0.25)")
+    parser.add_argument("--video-volume", type=float, default=1.0, help="Original video audio volume multiplier (e.g., 0.8)")
+    parser.add_argument("--fighting-mode", action="store_true", help="Enable fighting scene detection mode (overrides scoreboard OCR)")
+    parser.add_argument("--motion-threshold", type=float, default=15.0, help="Motion energy threshold for fighting scene detection")
+    parser.add_argument("--fighting-sample-fps", type=float, default=1.0, help="FPS to sample frames for fighting scene detection")
+    parser.add_argument("--combat-audio-threshold", type=float, default=2.0, help="Audio threshold multiplier for combat sound detection")
+    parser.add_argument("--max-duration", type=float, default=0, help="Maximum video duration to process in seconds (0 = no limit)")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
 
     args = parser.parse_args()
+
+    # Validate pitch parameter
+    if args.pitch <= 0:
+        logging.error("Pitch factor must be positive (got %.3f)", args.pitch)
+        sys.exit(1)
+    if args.pitch < 0.1 or args.pitch > 10.0:
+        logging.warning("Pitch factor %.3f is outside recommended range (0.1-10.0)", args.pitch)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -551,6 +961,22 @@ def main():
 
     duration = run_ffprobe_duration(input_path)
     logging.info("Video duration: %.1f s", duration)
+    
+    # Apply duration limit if specified
+    if args.max_duration > 0 and duration > args.max_duration:
+        logging.info("Limiting processing to first %.1f seconds (%.1f%% of video)", args.max_duration, 100.0 * args.max_duration / duration)
+        duration = args.max_duration
+    
+    if args.pitch != 1.0:
+        logging.info("Audio pitch adjustment: %.3fx (tempo will be adjusted)", args.pitch)
+    if isinstance(args.bgm, str) and args.bgm.strip():
+        bgm_abs = os.path.abspath(args.bgm)
+        if os.path.isfile(bgm_abs):
+            logging.info("Background music enabled: %s (video vol=%.2f, bgm vol=%.2f)", bgm_abs, args.video_volume, args.bgm_volume)
+            args.bgm = bgm_abs
+        else:
+            logging.warning("Background music file not found at %s. Proceeding without BGM.", bgm_abs)
+            args.bgm = ""
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -566,32 +992,71 @@ def main():
     events: List[float] = []
     roi_used: Optional[ROI] = None
 
-    if have_tess:
+    if args.fighting_mode:
+        logging.info("Fighting scene detection mode enabled.")
         try:
-            roi = find_best_roi(cap, duration, sample_fps=args.sample_fps)
-            if roi is not None:
-                roi_used = roi
-                logging.info("Selected ROI: %s at x=%d y=%d w=%d h=%d", roi.name, roi.x, roi.y, roi.w, roi.h)
-                events = detect_score_change_events(cap, duration, roi, sample_fps=args.sample_fps, min_gap_s=max(2.0, args.min_gap / 2.0))
-                logging.info("OCR detected %d score-change events before dedupe.", len(events))
-            else:
-                logging.warning("Failed to determine a reliable scoreboard ROI.")
+            # Primary: Motion-based fighting scene detection
+            events = detect_fighting_scenes(
+                cap, 
+                duration, 
+                sample_fps=args.fighting_sample_fps,
+                motion_threshold=args.motion_threshold,
+                min_gap_s=args.min_gap,
+                max_clips=args.max_clips if args.max_clips > 0 else None
+            )
+            logging.info("Motion analysis detected %d fighting scenes.", len(events))
+            
+            # Supplement with combat audio detection if motion detection yielded few results
+            if len(events) < 3:
+                logging.info("Supplementing with combat audio detection...")
+                with tempfile.TemporaryDirectory(prefix="nba_audio_") as td:
+                    wav_path = os.path.join(td, "audio.wav")
+                    try:
+                        extract_audio_wav(input_path, wav_path, ar=16000)
+                        combat_events = detect_combat_audio_peaks(
+                            wav_path, 
+                            threshold_std=args.combat_audio_threshold,
+                            min_gap_s=args.min_gap,
+                            max_peaks=args.max_clips if args.max_clips > 0 else None
+                        )
+                        # Merge and dedupe events
+                        all_events = events + combat_events
+                        all_events = dedupe_close_events(all_events, args.min_gap)
+                        events = all_events
+                        logging.info("Combined motion and audio detection found %d fighting scenes.", len(events))
+                    except Exception as e:
+                        logging.warning("Combat audio detection failed: %s", e)
         except Exception as e:
-            logging.warning("OCR path failed: %s", e)
-
-    # Fallback or supplement with audio peaks if OCR yielded nothing
-    if not events:
-        logging.info("Falling back to audio peak detection...")
-        with tempfile.TemporaryDirectory(prefix="nba_audio_") as td:
-            wav_path = os.path.join(td, "audio.wav")
+            logging.error("Fighting scene detection failed: %s", e)
+            sys.exit(1)
+    else:
+        # Original NBA highlight detection logic
+        if have_tess:
             try:
-                extract_audio_wav(input_path, wav_path, ar=16000)
-                t_arr, rms_arr, _ = audio_rms_envelope(wav_path, window_ms=250, hop_ms=125)
-                events = pick_peaks(t_arr, rms_arr, threshold_std=1.2, min_gap_s=args.min_gap, max_peaks=args.max_clips if args.max_clips > 0 else None)
-                logging.info("Audio peaks detected %d events.", len(events))
+                roi = find_best_roi(cap, duration, sample_fps=args.sample_fps)
+                if roi is not None:
+                    roi_used = roi
+                    logging.info("Selected ROI: %s at x=%d y=%d w=%d h=%d", roi.name, roi.x, roi.y, roi.w, roi.h)
+                    events = detect_score_change_events(cap, duration, roi, sample_fps=args.sample_fps, min_gap_s=max(2.0, args.min_gap / 2.0))
+                    logging.info("OCR detected %d score-change events before dedupe.", len(events))
+                else:
+                    logging.warning("Failed to determine a reliable scoreboard ROI.")
             except Exception as e:
-                logging.error("Audio-based detection failed: %s", e)
-                sys.exit(1)
+                logging.warning("OCR path failed: %s", e)
+
+        # Fallback or supplement with audio peaks if OCR yielded nothing
+        if not events:
+            logging.info("Falling back to audio peak detection...")
+            with tempfile.TemporaryDirectory(prefix="nba_audio_") as td:
+                wav_path = os.path.join(td, "audio.wav")
+                try:
+                    extract_audio_wav(input_path, wav_path, ar=16000)
+                    t_arr, rms_arr, _ = audio_rms_envelope(wav_path, window_ms=250, hop_ms=125)
+                    events = pick_peaks(t_arr, rms_arr, threshold_std=1.2, min_gap_s=args.min_gap, max_peaks=args.max_clips if args.max_clips > 0 else None)
+                    logging.info("Audio peaks detected %d events.", len(events))
+                except Exception as e:
+                    logging.error("Audio-based detection failed: %s", e)
+                    sys.exit(1)
 
     # Dedupe close events
     events = dedupe_close_events(events, args.min_gap)
@@ -626,7 +1091,7 @@ def main():
         for i, (start, dur) in enumerate(segments):
             temp_seg = os.path.join(td, f"seg_{i:04d}.mp4")
             try:
-                ffmpeg_extract_segment(input_path, start, dur, temp_seg, reencode=args.reencode)
+                ffmpeg_extract_segment(input_path, start, dur, temp_seg, reencode=args.reencode, pitch_factor=args.pitch)
             except subprocess.CalledProcessError as e:
                 logging.warning("Failed to cut segment %d at %.2fs (%.2fs): %s", i, start, dur, e)
                 continue
@@ -635,9 +1100,21 @@ def main():
             clip_name = f"{base_name}_{i:04d}.mp4"
             clip_out = os.path.join(clips_dir, clip_name)
             try:
-                if apply_wm:
-                    ffmpeg_overlay_watermark(temp_seg, wm_path, clip_out, margin=args.wm_margin, wm_width=args.wm_width)
+                # Finalize each clip: watermark and/or background music as requested
+                if apply_wm or (isinstance(args.bgm, str) and len(args.bgm) > 0):
+                    ffmpeg_finalize_clip(
+                        input_path=temp_seg,
+                        output_path=clip_out,
+                        watermark_path=wm_path if apply_wm else "",
+                        wm_margin=args.wm_margin,
+                        wm_width=args.wm_width,
+                        pitch_factor=args.pitch,
+                        bgm_path=args.bgm if isinstance(args.bgm, str) else "",
+                        video_volume=args.video_volume,
+                        bgm_volume=args.bgm_volume,
+                    )
                 else:
+                    # No finalize processing requested; just move the cut segment
                     shutil.move(temp_seg, clip_out)
                 concat_inputs.append(clip_out)
             except subprocess.CalledProcessError as e:
